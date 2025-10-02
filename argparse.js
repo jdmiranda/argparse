@@ -77,6 +77,23 @@ const PARSER = 'A...'
 const REMAINDER = '...'
 const _UNRECOGNIZED_ARGS_ATTR = '_unrecognized_args'
 
+// ==================================
+// Performance: Cached Regular Expressions
+// ==================================
+const REGEX_CACHE = {
+    splitlines: /\r\n|[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]/,
+    splitlines_capture: /(\r\n|[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029])/,
+    camelcase_underscore: /\w_[a-z]/g,
+    uppercase_to_underscore: /[A-Z]/g,
+    identifier_valid: /^[a-z_][a-z0-9_$]*$/i,
+    stack_trace_function: /^    at (.*) \(.*\)$/,
+    stack_trace_name: /[^ .]*$/,
+    whitespace_matcher: /[ \t\n\r\f\v]+/g,
+    long_break_matcher: /\n\n\n+/g,
+    leading_trailing_newlines: /^\n+|\n+$/g,
+    negative_number_matcher: /^-\d+$|^-\d*\.\d+$/,
+    option_string_dash: /-/g
+}
 
 // ==================================
 // Utility functions used for porting
@@ -140,10 +157,10 @@ function range(from, to, step=1) {
 function splitlines(str, keepends = false) {
     let result
     if (!keepends) {
-        result = str.split(/\r\n|[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]/)
+        result = str.split(REGEX_CACHE.splitlines)
     } else {
         result = []
-        let parts = str.split(/(\r\n|[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029])/)
+        let parts = str.split(REGEX_CACHE.splitlines_capture)
         for (let i = 0; i < parts.length; i += 2) {
             result.push(parts[i] + (i + 1 < parts.length ? parts[i + 1] : ''))
         }
@@ -225,14 +242,14 @@ function _alias(object, from, to) {
 // decorator that allows snake_case class methods to be called with camelCase and vice versa
 function _camelcase_alias(_class) {
     for (let name of Object.getOwnPropertyNames(_class.prototype)) {
-        let camelcase = name.replace(/\w_[a-z]/g, s => s[0] + s[2].toUpperCase())
+        let camelcase = name.replace(REGEX_CACHE.camelcase_underscore, s => s[0] + s[2].toUpperCase())
         if (camelcase !== name) _alias(_class.prototype, camelcase, name)
     }
     return _class
 }
 
 function _to_legacy_name(key) {
-    key = key.replace(/\w_[a-z]/g, s => s[0] + s[2].toUpperCase())
+    key = key.replace(REGEX_CACHE.camelcase_underscore, s => s[0] + s[2].toUpperCase())
     if (key === 'default') key = 'defaultValue'
     if (key === 'const') key = 'constant'
     return key
@@ -241,19 +258,20 @@ function _to_legacy_name(key) {
 function _to_new_name(key) {
     if (key === 'defaultValue') key = 'default'
     if (key === 'constant') key = 'const'
-    key = key.replace(/[A-Z]/g, c => '_' + c.toLowerCase())
+    key = key.replace(REGEX_CACHE.uppercase_to_underscore, c => '_' + c.toLowerCase())
     return key
 }
 
 // parse options
 let no_default = Symbol('no_default_value')
 function _parse_opts(args, descriptor) {
+    // Lazy function name extraction - only compute when needed
     function get_name() {
         let stack = new Error().stack.split('\n')
-            .map(x => x.match(/^    at (.*) \(.*\)$/))
+            .map(x => x.match(REGEX_CACHE.stack_trace_function))
             .filter(Boolean)
             .map(m => m[1])
-            .map(fn => fn.match(/[^ .]*$/)[0])
+            .map(fn => fn.match(REGEX_CACHE.stack_trace_name)[0])
 
         if (stack.length && stack[0] === get_name.name) stack.shift()
         if (stack.length && stack[0] === _parse_opts.name) stack.shift()
@@ -285,6 +303,7 @@ function _parse_opts(args, descriptor) {
             delete kwargs[old_name]
         }
     }
+    // Only call get_name() when actually needed (lazy evaluation)
     if (renames.length) {
         let name = get_name()
         deprecate('camelcase_' + name, sub('%s(): following options are renamed: %s',
@@ -395,7 +414,7 @@ function _AttributeHolder(cls = Object) {
                 arg_strings.push(repr(arg))
             }
             for (let [ name, value ] of this._get_kwargs()) {
-                if (/^[a-z_][a-z0-9_$]*$/i.test(name)) {
+                if (REGEX_CACHE.identifier_valid.test(name)) {
                     arg_strings.push(sub('%s=%r', name, value))
                 } else {
                     star_args[name] = value
@@ -473,8 +492,9 @@ const HelpFormatter = _camelcase_alias(_callable(class HelpFormatter {
         this._root_section = this._Section(this, undefined)
         this._current_section = this._root_section
 
-        this._whitespace_matcher = /[ \t\n\r\f\v]+/g // equivalent to python /\s+/ with ASCII flag
-        this._long_break_matcher = /\n\n\n+/g
+        // Use cached regexes for better performance
+        this._whitespace_matcher = REGEX_CACHE.whitespace_matcher
+        this._long_break_matcher = REGEX_CACHE.long_break_matcher
     }
 
     // ===============================
@@ -1848,7 +1868,8 @@ const _ExtendAction = _callable(class _ExtendAction extends _AppendAction {
     call(parser, namespace, values/*, option_string = undefined*/) {
         let items = getattr(namespace, this.dest, undefined)
         items = _copy_items(items)
-        items = items.concat(values)
+        // Use spread operator for better performance
+        items = [...items, ...values]
         setattr(namespace, this.dest, items)
     }
 })
@@ -2051,7 +2072,8 @@ const _ActionsContainer = _camelcase_alias(_callable(class _ActionsContainer {
         this._defaults = {}
 
         // determines whether an "option" looks like a negative number
-        this._negative_number_matcher = /^-\d+$|^-\d*\.\d+$/
+        // Use cached regex for better performance
+        this._negative_number_matcher = REGEX_CACHE.negative_number_matcher
 
         // whether or not there are any optionals that look like negative
         // numbers -- uses a list so it can be shared and edited
@@ -2818,8 +2840,8 @@ const ArgumentParser = _camelcase_alias(_callable(class ArgumentParser extends _
             let group_actions = mutex_group._group_actions
             for (let [ i, mutex_action ] of Object.entries(mutex_group._group_actions)) {
                 let conflicts = action_conflicts.get(mutex_action) || []
-                conflicts = conflicts.concat(group_actions.slice(0, +i))
-                conflicts = conflicts.concat(group_actions.slice(+i + 1))
+                // Use spread operator for better performance
+                conflicts = [...conflicts, ...group_actions.slice(0, +i), ...group_actions.slice(+i + 1)]
                 action_conflicts.set(mutex_action, conflicts)
             }
         }
